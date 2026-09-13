@@ -363,6 +363,53 @@ function debiles(n = 4){
    Primero lo que fallaste (queda vencido al instante), despues lo vencido de
    los conceptos flojos, y al final tarjetas nuevas de esos mismos conceptos.
    Nunca adelanta una tarjeta que no vencio: eso romperia el espaciado. */
+/* Reparto rotativo por dominio.
+   Priorizar los puntos flojos, solo, llena el examen de un tema: medido, un
+   concepto fallado se llevaba 7 de 10. Un examen asi no entrena el cambio de
+   contexto, que es lo que pide un examen de cinco dominios.
+
+   Asi que en vez de ordenar por prioridad y cortar, se reparte por turnos:
+   se recorre dominio por dominio tomando su mejor candidata, y se vuelve a
+   empezar. La prioridad decide QUIEN sale primero dentro de cada dominio; la
+   rotacion garantiza que estan todos representados. Con diez lugares y cinco
+   dominios salen ~2 de cada uno, siempre mezclado.
+
+   El techo por concepto sigue vigente por si un dominio tiene un solo tema
+   flojo y lo repetiria dentro de su propio turno. */
+const MAX_CONCEPTO = 3;
+function repartir(candidatos, cupo){
+  if(cupo <= 0) return [];
+  const porDom = new Map();
+  for(const t of candidatos){
+    const q = PORID.get(t.id); if(!q) continue;
+    const d = q.dom || "?";
+    if(!porDom.has(d)) porDom.set(d, []);
+    porDom.get(d).push(t);          // llegan ya ordenados por prioridad
+  }
+  // Arrancar por el dominio con la candidata mas urgente, no siempre por el mismo.
+  const doms = [...porDom.keys()];
+  const elegidas = [], porC = {};
+  let quedan = true;
+  while(elegidas.length < cupo && quedan){
+    quedan = false;
+    for(const d of doms){
+      if(elegidas.length >= cupo) break;
+      const lista = porDom.get(d);
+      while(lista.length){
+        const t = lista.shift();
+        const c = concepto(PORID.get(t.id));
+        if((porC[c]||0) >= MAX_CONCEPTO) continue;   // saltear, probar la siguiente
+        porC[c] = (porC[c]||0)+1; elegidas.push(t); quedan = true; break;
+      }
+      if(lista.length) quedan = true;
+    }
+  }
+  // Si el techo por concepto dejo huecos, se afloja antes que entregar menos.
+  if(elegidas.length < cupo)
+    elegidas.push(...candidatos.filter(t => !elegidas.includes(t)).slice(0, cupo - elegidas.length));
+  return elegidas;
+}
+
 function sesion(ahora = Date.now()){
   const deb = debilidad(), peso = q => deb.get(concepto(q)) ?? 0.25;
   const v = Object.values(S.tarjetas).filter(t => !t.rota && t.prox <= ahora && PORID.has(t.id));
@@ -375,13 +422,17 @@ function sesion(ahora = Date.now()){
   const nuevas = v.filter(t => t.vistas === 0)
     .sort((a,b) => peso(PORID.get(b.id)) - peso(PORID.get(a.id)));
 
-  const cola = reap.slice(0, POR_SESION);
+  // Lo que fallaste entra siempre, pero tambien con techo: si fallaste ocho de
+  // un mismo tema, no queremos las ocho el mismo dia.
+  const cola = repartir(reap, POR_SESION);
   const cupoNuevas = Math.min(NUEVAS, nuevas.length, Math.max(0, POR_SESION - cola.length));
-  cola.push(...repasos.slice(0, POR_SESION - cola.length - cupoNuevas));
-  cola.push(...nuevas.slice(0, cupoNuevas));
-  if(cola.length < POR_SESION) cola.push(...nuevas.slice(cupoNuevas, cupoNuevas + POR_SESION - cola.length));
-  if(cola.length < POR_SESION) cola.push(...repasos.slice(0, POR_SESION - cola.length).filter(t => !cola.includes(t)));
-  cola.reap = reap.length;
+  cola.push(...repartir(repasos.filter(t => !cola.includes(t)), POR_SESION - cola.length - cupoNuevas));
+  cola.push(...repartir(nuevas.filter(t => !cola.includes(t)), cupoNuevas));
+  if(cola.length < POR_SESION)
+    cola.push(...[...repasos, ...nuevas, ...reap].filter(t => !cola.includes(t))
+      .slice(0, POR_SESION - cola.length));
+  cola.reap = cola.filter(t => t.reap).length;
+  cola.temas = new Set(cola.map(t => PORID.get(t.id)?.dom)).size;
   cola.adaptada = deb.size > 0;
   return cola;
 }
@@ -422,9 +473,10 @@ async function armarConIA(){
     `ERRORES RECIENTES:\n${errores || "(ninguno)"}\n\n` +
     `Elegí EXACTAMENTE ${POR_SESION} ids de la lista y ordenalos. Criterio: priorizá las ` +
     `que atacan las confusiones que se ven en sus errores, y cuando dos preguntas ` +
-    `contrastan conceptos que está mezclando, ponelas juntas. Variá los dominios; ` +
-    `no pongas ${POR_SESION} del mismo tema. En "motivo" explicá en UNA oración, en ` +
-    `español rioplatense tuteando, qué trabaja este examen.`,
+    `contrastan conceptos que está mezclando, ponelas juntas.\n` +
+    `OBLIGATORIO: el examen tiene que cubrir VARIOS dominios, no mas de ${MAX_CONCEPTO} ` +
+    `preguntas del mismo concepto, y lo mas repartido posible entre los cinco dominios.\n` +
+    `En "motivo" explicá en UNA oración, en español rioplatense tuteando, qué trabaja este examen.`,
     {tier:"default", schema:{type:"object", properties:{
       ids:{type:"array", items:{type:"string"}, minItems:POR_SESION, maxItems:POR_SESION},
       motivo:{type:"string"}}, required:["ids","motivo"]}});
@@ -437,6 +489,10 @@ async function armarConIA(){
     if(t && !vistos.has(id)){ vistos.add(id); elegidas.push(t); }
   }
   if(elegidas.length < 3) return null;                 // devolvio cualquier cosa
+  // Si la IA ignora el techo, se lo aplicamos igual: la regla no es negociable.
+  const conTecho = repartir(elegidas, POR_SESION);
+  elegidas.length = 0; elegidas.push(...conTecho);
+  for(const t of conTecho) vistos.add(t.id);
   for(const t of pool){                                 // completar si quedo corto
     if(elegidas.length >= POR_SESION) break;
     if(!vistos.has(t.id)){ vistos.add(t.id); elegidas.push(t); }
@@ -454,6 +510,40 @@ function stats(){
     dudando: h.filter(e => e.ok && e.seg === false).length};
 }
 const distractor = (i, correcta) => i > correcta ? i-1 : i;
+
+/* ---------- barajar las opciones ----------
+   Si la respuesta correcta cae siempre en la misma letra, terminas recordando
+   "era la C" en vez del concepto. Cada vez que volves a ver una pregunta, las
+   opciones salen en otro orden.
+
+   Lo delicado es que TODO lo que va indexado por opcion tiene que moverse con
+   ellas: cual es la correcta y la explicacion de cada distractor. Y lo que se
+   guarda en el historial tiene que ser el indice ORIGINAL, porque el
+   diagnostico lee la pregunta sin barajar — si guardaramos el indice mostrado,
+   le estariamos diciendo que elegiste una opcion que no elegiste. */
+function _hash(str){
+  let h = 2166136261 >>> 0;
+  for(let i = 0; i < str.length; i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return h;
+}
+function _rnd(semilla){
+  let x = semilla >>> 0;
+  return () => { x = (Math.imul(x, 1664525) + 1013904223) >>> 0; return x / 4294967296; };
+}
+function barajar(q, vuelta){
+  const orden = [0,1,2,3], r = _rnd(_hash(String(q.id)) + vuelta * 7919);
+  for(let i = 3; i > 0; i--){ const j = Math.floor(r()*(i+1)); [orden[i],orden[j]] = [orden[j],orden[i]]; }
+  // Explicacion por opcion ORIGINAL (porque_incorrectas saltea la correcta).
+  const expl = [];
+  for(let o = 0; o < 4; o++)
+    expl[o] = o === q.correcta ? null
+      : (q.porque_incorrectas ? q.porque_incorrectas[o > q.correcta ? o-1 : o] : "");
+  return {...q,
+    opciones: orden.map(o => q.opciones[o]),
+    correcta: orden.indexOf(q.correcta),
+    porque_opcion: orden.map(o => expl[o]),
+    _orden: orden};                       // _orden[mostrado] = original
+}
 
 const COD = {"Security Principles":"SEC","Network Security":"NET","Access Controls":"ACC",
              "Security Operations":"OPS","BC, DR e Incidentes":"BCP"};
@@ -566,7 +656,7 @@ function ics(hora){
 const app = document.getElementById("app"), ptsEl = document.getElementById("pts");
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 let cola = [], idx = 0, elegida = null, t0 = 0, aciertosSesion = 0, ptsSesion = 0, ultimo = null;
-let modo = "diario", simIni = 0, simResp = [], relojId = null, curado = null;
+let modo = "diario", simIni = 0, simResp = [], relojId = null, curado = null, qv = null;
 
 function fmt(ms){
   const t = Math.max(0, Math.round(ms/1000));
@@ -600,7 +690,8 @@ function irHome(){
       <span class="lbl">${cola.length===1?"pregunta para hoy":"preguntas para hoy"}</span>
       ${_cur ? `<span class="why">${esc(_cur.motivo)} · lo armó ${_cur.motor}</span>`
         : cola.reap ? `<span class="why">${cola.reap} que fallaste vuelven en este examen</span>`
-        : cola.adaptada ? '<span class="why">ordenadas por donde venís fallando</span>' : ""}
+        : cola.adaptada ? `<span class="why">priorizadas por donde venís fallando · ${
+            cola.temas} dominios mezclados</span>` : ""}
     </div>
     <button class="cta" id="go" ${cola.length?"":"disabled"}>
       ${cola.length ? "Empezar examen" : "Al día — volvé mañana"}</button>
@@ -821,7 +912,9 @@ async function profundizar(conc, boton){
 }
 
 function pintarQ(){
-  const t = cola[idx], q = PORID.get(t.id);
+  const t = cola[idx], base = PORID.get(t.id);
+  // La vuelta cambia con las veces que la viste, asi el orden cambia cada vez.
+  const q = qv = barajar(base, t.vistas + (modo === "simulacro" ? 101 : 0));
   const deb = debilidad().get(concepto(q));
   elegida = null; t0 = Date.now();
   app.innerHTML = `
@@ -959,12 +1052,13 @@ function preguntarConfianza(i){
 }
 
 function responder(i, seguro){
-  const t = cola[idx], q = PORID.get(t.id);
+  const t = cola[idx], q = qv || PORID.get(t.id);
+  const orig = q._orden ? q._orden[i] : i;      // indice en el orden original
   elegida = i;
 
   // En simulacro no hay feedback: se registra y se pasa, como en el examen real.
   if(modo === "simulacro"){
-    simResp.push({id:t.id, ok: i === q.correcta, el:i});
+    simResp.push({id:t.id, ok: i === q.correcta, el:orig});
     [...document.querySelectorAll(".opt")].forEach((b,j) => {
       b.disabled = true; if(j === i) b.classList.add("dim");
     });
@@ -985,7 +1079,7 @@ function responder(i, seguro){
     S.pts += gano; ptsSesion += gano;
   }
   S.tarjetas[t.id] = revisar(t, cal);
-  S.hist.push({id:t.id, f:Date.now(), cal, ok, ms, el:i, seg:!!seguro});
+  S.hist.push({id:t.id, f:Date.now(), cal, ok, ms, el:orig, seg:!!seguro});
   guardar(); pintarPts();
 
   [...document.querySelectorAll(".opt")].forEach((b,j) => {
@@ -1004,7 +1098,7 @@ function responder(i, seguro){
         : `<span class="gain cero">${seguro?"estabas seguro — vuelve pronto":"sin puntos"}</span>`}
     </div>
     ${(!ok && tieneExp) ? `<div class="blk err"><div class="lbl">Por qué lo que elegiste está mal</div>
-      ${esc(q.porque_incorrectas[distractor(i,q.correcta)] || "")}</div>` : ""}
+      ${esc((q.porque_opcion ? q.porque_opcion[i] : q.porque_incorrectas[distractor(i,q.correcta)]) || "")}</div>` : ""}
     ${(!ok && !tieneExp) ? `<div class="blk err"><div class="lbl">La correcta era</div>
       ${esc(q.opciones[q.correcta])}</div>` : ""}
     <div id="det" class="${ok?"hidden":""}">
