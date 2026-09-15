@@ -304,7 +304,24 @@ const N_OBJ = Object.keys(OBJS).length;
 const CONC = JSON.parse(document.getElementById("cdata").textContent);
 const TOT_CONC = Object.values(CONC).reduce((n,v) => n + v.length, 0);
 const objsDe = d => Object.keys(OBJS).filter(o => OBJS[o].dom === d);
-const DIA = 86400000, POR_SESION = 10, NUEVAS = 3, CLAVE = "iscc-cc-v2";
+const DIA = 86400000, POR_SESION = 10, CLAVE = "iscc-cc-v2";
+
+/* ---------- de que se compone el examen de hoy ----------
+   Con un tope fijo de tres preguntas nuevas por sesion, el examen daba siete
+   repasos y tres nuevas TODOS los dias: simulado a treinta dias, habias visto
+   100 de 198. El espaciado no estaba mal; el reparto si.
+
+   Ahora el cupo se mueve con la cobertura: mientras falte mucho por ver, el
+   examen se inclina al material nuevo; cuando ya recorriste el banco, se
+   inclina al repaso, que es cuando el repaso vale. */
+function cupoNuevo(sinVer, total){
+  if(sinVer <= 0) return 0;
+  const cubierto = 1 - sinVer / Math.max(total, 1);
+  return cubierto < 0.5 ? 6 : cubierto < 0.8 ? 4 : 3;
+}
+/* Las falladas vuelven siempre, pero no todas en el mismo examen: si fallaste
+   ocho, entran cuatro hoy y el resto mañana. No salen de rotacion. */
+const MAX_REAP = 4;
 const SIM_N = 100, SIM_MS = 2*60*60*1000, UMBRAL = 0.70;
 
 /* ---------- estado ---------- */
@@ -367,7 +384,10 @@ function revisar(t, q, ahora = Date.now()){
   if(q < 3) return {...t, ef, reps:0, iv:1, lapsos:t.lapsos+1, reap:1,
     vistas:t.vistas+1, prox:0};
   const reps = t.reps + 1;
-  const iv = reps===1 ? 1 : reps===2 ? 6 : Math.round(Math.max(t.iv,1)*ef);
+  // Primer intervalo de dos dias, no uno. Con uno, TODO lo que acertabas hoy
+  // vencia mañana y la cola de repasos se comia el examen entero: medido, te
+  // dejaba siete repasos y tres preguntas nuevas todos los dias.
+  const iv = reps===1 ? 2 : reps===2 ? 6 : Math.round(Math.max(t.iv,1)*ef);
   return {...t, ef, reps, iv, reap:0, vistas:t.vistas+1,
     aciertos:t.aciertos+1, prox: ahora + iv*DIA};
 }
@@ -512,12 +532,17 @@ function sesion(ahora = Date.now()){
     return peso(qb) - peso(qa);
   });
 
-  // Lo que fallaste entra siempre, pero tambien con techo: si fallaste ocho de
-  // un mismo tema, no queremos las ocho el mismo dia.
-  const cola = repartir(reap, POR_SESION);
-  const cupoNuevas = Math.min(NUEVAS, nuevas.length, Math.max(0, POR_SESION - cola.length));
-  cola.push(...repartir(repasos.filter(t => !cola.includes(t)), POR_SESION - cola.length - cupoNuevas));
-  cola.push(...repartir(nuevas.filter(t => !cola.includes(t)), cupoNuevas));
+  // El cupo de nuevas se reserva ANTES de repartir: si no, los repasos vencidos
+  // se quedan con todo el examen y el material nuevo no entra nunca.
+  const activas = BANCO.filter(admitida).length;
+  const sinVerN = Object.values(S.tarjetas).filter(t => {
+    const q = PORID.get(t.id); return q && !t.rota && t.vistas === 0 && admitida(q);
+  }).length;
+  const cupoNuevas = Math.min(cupoNuevo(sinVerN, activas), nuevas.length);
+  const cola = repartir(reap, Math.min(MAX_REAP, POR_SESION - cupoNuevas));
+  cola.push(...repartir(nuevas.filter(t => !cola.includes(t)),
+    Math.min(cupoNuevas, POR_SESION - cola.length)));
+  cola.push(...repartir(repasos.filter(t => !cola.includes(t)), POR_SESION - cola.length));
   // El relleno TAMBIEN reparte por dominio. Antes tiraba las que sobraban en
   // crudo, y con el progreso vacio (sin repasos, cupo de nuevas agotado) eso
   // era la mayor parte del examen: volvia a concentrarse en pocos dominios.
@@ -525,6 +550,7 @@ function sesion(ahora = Date.now()){
     cola.push(...repartir([...repasos, ...nuevas, ...reap].filter(t => !cola.includes(t)),
       POR_SESION - cola.length));
   cola.reap = cola.filter(t => t.reap).length;
+  cola.nuevas = cola.filter(t => t.vistas === 0).length;
   cola.temas = new Set(cola.map(t => PORID.get(t.id)?.dom)).size;
   cola.adaptada = deb.size > 0;
   return cola;
@@ -595,7 +621,11 @@ async function armarConIA(){
 }
 
 function stats(){
-  const ts = Object.values(S.tarjetas).filter(t => PORID.has(t.id)), h = S.hist;
+  // Solo las admitidas: con "solo del libro" activado el banco activo son 198,
+  // y decir "36/456" hace parecer que el examen ignora 420 preguntas.
+  const ts = Object.values(S.tarjetas).filter(t => {
+    const q = PORID.get(t.id); return q && admitida(q);
+  }), h = S.hist;
   return {total:ts.length, vistas:ts.filter(t=>t.vistas>0).length,
     dominadas:ts.filter(t=>t.iv>=21).length,
     acierto: h.length ? Math.round(100*h.filter(e=>e.ok).length/h.length) : 0, racha:racha(),
@@ -825,9 +855,11 @@ function irHome(){
       <span class="n mono">${cola.length}</span>
       <span class="lbl">${cola.length===1?"pregunta para hoy":"preguntas para hoy"}</span>
       ${_cur ? `<span class="why">${esc(_cur.motivo)} · lo armó ${_cur.motor}</span>`
-        : cola.reap ? `<span class="why">${cola.reap} que fallaste vuelven en este examen</span>`
-        : cola.adaptada ? `<span class="why">priorizadas por donde venís fallando · ${
-            cola.temas} dominios mezclados</span>` : ""}
+        : `<span class="why">${[
+              cola.nuevas ? `${cola.nuevas} que nunca viste` : "",
+              cola.reap ? `${cola.reap} que fallaste` : "",
+              cola.length - cola.nuevas - cola.reap ? `${cola.length - cola.nuevas - cola.reap} de repaso` : ""
+            ].filter(Boolean).join(" · ")}</span>`}
     </div>
     <button class="cta" id="go" ${cola.length?"":"disabled"}>
       ${cola.length ? "Empezar examen" : "Al día — volvé mañana"}</button>
